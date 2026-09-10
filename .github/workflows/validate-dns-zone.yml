@@ -1,0 +1,57 @@
+name: Validate DNS-zone nameservers
+on:
+  push:
+    branches:
+      - validation/5367-dns-zone-validation
+permissions:
+  contents: read
+jobs:
+  dns-zone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: src
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the project test environment
+        run: |
+          docker compose build app > /tmp/dns-zone-build.log 2>&1 || { tail -150 /tmp/dns-zone-build.log; exit 1; }
+          tail -12 /tmp/dns-zone-build.log
+          docker compose up -d db
+          timeout 60 bash -c 'until docker compose exec -T db pg_isready -U user -d app; do sleep 2; done'
+      - name: Reproduce the original validation failure
+        run: |
+          cp registrar/models/dns/dns_zone.py /tmp/dns-zone-fixed.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('registrar/models/dns/dns_zone.py')
+          s = p.read_text()
+          old = 'raise ValidationError({"nameservers": "DNS zone must have at least 2 nameservers."})'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, old.replace('raise', 'return', 1)))
+          PY
+          set +e
+          docker compose run --rm -T app python manage.py test registrar.tests.test_dns_zone_validation --noinput --verbosity 2 > /tmp/dns-zone-before.log 2>&1
+          result=$?
+          set -e
+          cp /tmp/dns-zone-fixed.py registrar/models/dns/dns_zone.py
+          tail -100 /tmp/dns-zone-before.log
+          test "$result" -eq 1
+          grep -q 'FAILED (failures=' /tmp/dns-zone-before.log
+      - name: Run the model and form regression tests
+        run: docker compose run --rm -T app python manage.py test registrar.tests.test_dns_zone_validation --noinput --verbosity 2
+      - name: Run neighboring validation tests
+        run: docker compose run --rm -T app python manage.py test registrar.tests.test_cleaners registrar.tests.test_validations registrar.tests.test_enums --noinput --verbosity 1
+      - name: Check formatting and lint
+        run: |
+          docker compose run --rm -T --no-deps app black --check --diff registrar/models/dns/dns_zone.py registrar/tests/test_dns_zone_validation.py
+          docker compose run --rm -T --no-deps app flake8 registrar/models/dns/dns_zone.py registrar/tests/test_dns_zone_validation.py
+          docker compose run --rm -T --no-deps app mypy registrar/models/dns/dns_zone.py registrar/tests/test_dns_zone_validation.py
+          docker compose run --rm -T --no-deps app bandit -q registrar/models/dns/dns_zone.py registrar/tests/test_dns_zone_validation.py
+      - name: Check migrations
+        run: docker compose run --rm -T app python manage.py makemigrations --check --dry-run
+      - name: Stop isolated test services
+        if: always()
+        run: docker compose down --volumes
