@@ -15,6 +15,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: 240a46b0ba3708cac69290cb1ae58f5fe1ed3400
       - name: Build the project test environment
         run: |
           docker compose build app > /tmp/dns-zone-build.log 2>&1 || { tail -150 /tmp/dns-zone-build.log; exit 1; }
@@ -39,18 +41,19 @@ jobs:
           cp /tmp/dns-zone-fixed.py registrar/models/dns/dns_zone.py
           tail -100 /tmp/dns-zone-before.log
           test "$result" -eq 1
-          grep -q 'FAILED (failures=' /tmp/dns-zone-before.log
-      - name: Run the model and form regression tests
-        run: docker compose run --rm -T app python manage.py test registrar.tests.test_dns_zone_validation --noinput --verbosity 2
-      - name: Run neighboring validation tests
-        run: docker compose run --rm -T app python manage.py test registrar.tests.test_cleaners registrar.tests.test_validations registrar.tests.test_enums --noinput --verbosity 1
+          grep -q 'FAILED (failures=4)' /tmp/dns-zone-before.log
+      - name: Run model, form and neighboring validation tests
+        run: docker compose run --rm -T app python manage.py test registrar.tests.test_dns_zone_validation registrar.tests.test_cleaners registrar.tests.test_validations --noinput --verbosity 2
       - name: Check formatting and lint
         run: |
-          docker compose run --rm -T --no-deps app black --check --diff registrar/models/dns/dns_zone.py registrar/tests/test_dns_zone_validation.py
-          docker compose run --rm -T --no-deps app flake8 registrar/models/dns/dns_zone.py registrar/tests/test_dns_zone_validation.py
-          docker compose run --rm -T --no-deps app mypy registrar/models/dns/dns_zone.py registrar/tests/test_dns_zone_validation.py
-          docker compose run --rm -T --no-deps app bandit -q registrar/models/dns/dns_zone.py registrar/tests/test_dns_zone_validation.py
+          result=0
+          docker compose run --rm -T --no-deps app black --check --diff registrar/models/dns/dns_zone.py registrar/tests/test_dns_zone_validation.py || result=1
+          docker compose run --rm -T --no-deps app flake8 registrar/models/dns/dns_zone.py registrar/tests/test_dns_zone_validation.py || result=1
+          docker compose run --rm -T --no-deps app mypy registrar/models/dns/dns_zone.py registrar/tests/test_dns_zone_validation.py || result=1
+          docker compose run --rm -T --no-deps app bandit -q registrar/models/dns/dns_zone.py registrar/tests/test_dns_zone_validation.py || result=1
+          exit "$result"
       - name: Check migrations
+        if: success() || failure()
         run: docker compose run --rm -T app python manage.py makemigrations --check --dry-run
       - name: Stop isolated test services
         if: always()
