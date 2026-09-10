@@ -1,0 +1,96 @@
+name: Validate domain notification recipients
+on:
+  push:
+    branches: [validation/5395-notification-recipients]
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Prepare clean candidate
+        run: |
+          cp src/registrar/tests/test_notification_recipients.py "$RUNNER_TEMP/test_notification_recipients.py"
+          git switch -c fix/5395-notification-recipients dbb8cc1d01907c4329f1cdefc873504a68125cb7
+          cp "$RUNNER_TEMP/test_notification_recipients.py" src/registrar/tests/test_notification_recipients.py
+      - name: Build isolated project test environment
+        working-directory: src
+        run: |
+          docker compose build app > "$RUNNER_TEMP/build.log" 2>&1 || { tail -100 "$RUNNER_TEMP/build.log"; exit 1; }
+          tail -8 "$RUNNER_TEMP/build.log"
+          docker compose up -d db
+          timeout 60 bash -c 'until docker compose exec -T db pg_isready -U user -d app; do sleep 2; done'
+      - name: Reproduce invalid recipient lists
+        working-directory: src
+        run: |
+          set +e
+          docker compose run --rm -T app python manage.py test registrar.tests.test_notification_recipients --noinput --verbosity 2 > "$RUNNER_TEMP/before.log" 2>&1
+          result=$?
+          set -e
+          tail -125 "$RUNNER_TEMP/before.log"
+          test "$result" -eq 1
+          grep -q 'FAILED (failures=6)' "$RUNNER_TEMP/before.log"
+      - name: Exclude invitations and empty manager emails
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/registrar/utility/email_invitations.py')
+          source = p.read_text()
+          old = '        UserDomainRole.objects.filter(domain=domain).values_list("user__email", flat=True).distinct()'
+          new = ('        UserDomainRole.objects.filter(domain=domain, user__isnull=False)\n'
+                 '        .exclude(user__email="")\n'
+                 '        .values_list("user__email", flat=True)\n'
+                 '        .distinct()')
+          assert source.count(old) == 2
+          p.write_text(source.replace(old, new))
+          p = Path('src/registrar/tests/test_email_invitations.py')
+          source = p.read_text()
+          for name, next_name, mock in [
+              ('TestSendDomainManagerOnHoldEmail', 'TestDomainRenewalNotificationEmail', 'mock_filter'),
+              ('TestDomainRenewalNotificationEmail', 'TestSendDomainDeletedEmailToManagerAndAdmins', 'mock_domain_role_filter'),
+          ]:
+              start = source.index('class ' + name + '(')
+              end = source.index('class ' + next_name + '(', start)
+              block = source[start:end]
+              old_chain = mock + '.return_value.values_list.return_value'
+              assert old_chain in block
+              block = block.replace(old_chain, mock + '.return_value.exclude.return_value.values_list.return_value')
+              old_assertion = mock + '.assert_called_once_with(domain=self.domain)'
+              assert old_assertion in block
+              block = block.replace(old_assertion, mock + '.assert_called_once_with(domain=self.domain, user__isnull=False)\n        ' + mock + '.return_value.exclude.assert_called_once_with(user__email="")')
+              source = source[:start] + block + source[end:]
+          p.write_text(source)
+          PY
+      - name: Format and run complete email tests
+        working-directory: src
+        run: |
+          docker compose run --rm -T --no-deps app black registrar/utility/email_invitations.py registrar/tests/test_email_invitations.py registrar/tests/test_notification_recipients.py
+          docker compose run --rm -T app python manage.py test registrar.tests.test_notification_recipients registrar.tests.test_email_invitations --noinput --verbosity 2
+          docker compose run --rm -T --no-deps app flake8 registrar/utility/email_invitations.py registrar/tests/test_email_invitations.py registrar/tests/test_notification_recipients.py
+          docker compose run --rm -T --no-deps app mypy registrar/utility/email_invitations.py registrar/tests/test_notification_recipients.py
+          docker compose run --rm -T --no-deps app bandit -q registrar/utility/email_invitations.py registrar/tests/test_notification_recipients.py
+          git diff --check
+      - name: Show remaining role-user access sites for audit
+        if: success() || failure()
+        run: |
+          git grep -n -E '(user_domain_role|domain_role|domain_manager)\.user\.|UserDomainRole.objects.*values_list|values_list\("user__email"' -- src/registrar ':!src/registrar/tests' ':!src/registrar/migrations' || true
+      - name: Publish only tested source and regression tests
+        run: |
+          git add src/registrar/utility/email_invitations.py src/registrar/tests/test_email_invitations.py src/registrar/tests/test_notification_recipients.py
+          git diff --cached --check
+          git config user.name 'Sylvester Kaczmarek'
+          git config user.email '16242628+sylvesterkaczmarek@users.noreply.github.com'
+          git commit -s -m 'Exclude pending invitations from domain notification recipients'
+          git push origin HEAD:refs/heads/fix/5395-notification-recipients
+          git show --stat --oneline HEAD
+      - name: Stop isolated test services
+        if: always()
+        working-directory: src
+        run: docker compose down --volumes
